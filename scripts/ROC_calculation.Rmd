@@ -1,0 +1,333 @@
+---
+title: "ROC calculation"
+output: html_document
+date: "2023"
+---
+
+```{r}
+library(zoo)
+library(tidyverse)
+library(gridExtra)
+```
+
+
+# Load data
+
+```{r}
+#data <- read.csv("../data/nv.csv")
+data <- read.csv("../data/data_week_noduplicate.csv")
+```
+
+# Predict missing values for 193 variables and viral load
+
+Prediction is done separately for naive and vaccinated samples. (after challenge)
+
+```{r}
+# Dataframes for putting predicted values for all measurements
+data.naive <- data.frame(week.timepoint = rep(seq(0,20), 5),
+                  Animal.No. = unlist(lapply(as.character(unique(data[which(data$arm == 'naive'), "Animal.No."])), rep, times = 21)))
+data.vac <- data.frame(week.timepoint = rep(seq(0,20), 6),
+                  Animal.No. = unlist(lapply(as.character(unique(data[which(data$arm == 'SIVmac239_ΔGY' & data$challenge.tp == FALSE), "Animal.No."])), rep, times =  21)))
+roc.naive <- data.frame(week.timepoint = rep(seq(0,20), 5),
+                  Animal.No. = unlist(lapply(as.character(unique(data[which(data$arm == 'naive'), "Animal.No."])), rep, times = 21)))
+roc.vac <- data.frame(week.timepoint = rep(seq(0,20), 6),
+                  Animal.No. = unlist(lapply(as.character(unique(data[which(data$arm == 'SIVmac239_ΔGY' & data$challenge.tp == FALSE), "Animal.No."])), rep, times =  21)))
+```
+
+## Naive
+
+```{r}
+for (measurement in colnames(data)[c(5,11:203)]) {
+  
+# new dataframe for viral loads
+viral.load.auc <- data.frame(week.timepoint = seq(0,20))
+# assign week values
+#viral.load.auc$week.timepoint <- seq(0,20)
+
+# naive cases
+for (i in unique(data[which(data$arm == 'naive'),]$Animal.No.)) {
+  print(i)
+  # subset animals for merging
+  temp.df.merging <- data[which(data$Animal.No. == i),c("week.timepoint", measurement)]
+  colnames(temp.df.merging) <- c("week.timepoint",i)
+  
+  temp.df.merging <- temp.df.merging[temp.df.merging$week.timepoint <=20,]
+  
+  # assign initial viral loads
+  viral.load.auc <- merge(viral.load.auc, temp.df.merging, by = "week.timepoint", all = TRUE)
+  #viral.load.auc[,i] <- viral.load.auc$RNACopies.ml # assign RNA values to the corresponding animal.no. column
+  #viral.load.auc <- viral.load.auc[,-13] #drop RNACopies.ml column
+}
+
+# fit a curve to the data using loess (naive)
+loess.pred <- data.frame(week.timepoint = seq(0,20,1))
+
+for (i in unique(data[which(data$arm == 'naive'),]$Animal.No.)) {
+  #print(i)
+  #subset wrt Animal.No. and first 20 weeks
+  temp.df.merging <- data[which(data$Animal.No. == i),c("week.timepoint", measurement)]
+  temp.df.merging <- temp.df.merging[temp.df.merging$week.timepoint <= 20,]
+  # loess fit
+  fit <- loess(get(measurement) ~ week.timepoint, data = temp.df.merging)
+  # prediction of missing points
+  predictions.df <- data.frame(week.timepoint = seq(0,20,1))
+  pred <- data.frame(vl.pred = predict(fit, predictions.df))
+  pred$week.timepoint <- predictions.df$week.timepoint
+  
+  # assign to df
+  loess.pred[,i] <- pred$vl.pred 
+}
+# Forecast for NA values (naive)
+for (i in unique(data[which(data$arm == 'naive'),]$Animal.No.)) {
+  #print(i)
+  # calculate fit for forecast
+  forecast.fit <- auto.arima(loess.pred[1:length(na.omit(loess.pred[,i])),i], seasonal = FALSE)
+  # forecast
+  forecast.number <- nrow(loess.pred) - length(na.omit(loess.pred[,i]))
+  loess.pred.forecast <- forecast(forecast.fit,forecast.number)
+  print(loess.pred.forecast$method)
+  # append forecast to initial values
+  full.set <- c(loess.pred.forecast$x, loess.pred.forecast$mean)
+  # assign to df
+  #print(i)
+  #print(length(full.set))
+  #print(full.set)
+  #print("-------")
+  #col.name.holder <- paste0(i, ".forecast")
+  loess.pred[,i] <- full.set
+}
+loess.pred[loess.pred < 0] <- 0
+long.holder <- pivot_longer(loess.pred, cols=-week.timepoint)
+colnames(long.holder) <- c("week.timepoint", "Animal.No.", measurement)
+
+######### ROC calculation
+roc.df <- data.frame(loess.pred$week.timepoint,
+                    lapply(loess.pred[,-1], function(x) c(NA, diff(x) / x[-length(x)] * 100)))
+colnames(roc.df)[1] <- "week.timepoint"
+roc.long.holder <- pivot_longer(roc.df, cols=-week.timepoint)
+colnames(roc.long.holder) <- c("week.timepoint", "Animal.No.", paste0("roc_",measurement))
+#########
+
+#add measurement to main df (data.naive)
+data.naive <- inner_join(data.naive, long.holder, by = c("week.timepoint", "Animal.No."))
+
+#add roc to roc df (roc.naive)
+roc.naive <- inner_join(roc.naive, roc.long.holder, by = c("week.timepoint", "Animal.No."))
+}
+roc.naive[is.na(roc.naive)] <- 0
+```
+
+### Visualize absolute measurement and ROC feature
+```{r}
+ggplot(data[which(data$Animal.No. == "MA39"),], aes(x= week.timepoint, y= TIgG_SIV.1.mac251)) + 
+  geom_line() + 
+  geom_point(data = data.naive[which(data.naive$Animal.No. == "MA39"),], aes(x= week.timepoint, y= TIgG_SIV.1.mac251))
+```
+
+```{r}
+ggplot(data = roc.naive[which(roc.naive$Animal.No. == "MA39"),], aes(x= week.timepoint, y= roc_TIgG_SIV.1.mac251)) + 
+  geom_point() + 
+  geom_line()
+```
+
+## vaccinated (after challenge)
+
+```{r}
+for (measurement in colnames(data)[c(5,11:203)]) {
+# fit a curve to the data using loess (∆GY, after challenge)
+# use the same set for the loop since LJ48 does not have data before challenge
+loess.pred.gy.after <- data.frame(week.timepoint = seq(0,20,1))
+
+for (i in unique(data[which(data$arm == 'SIVmac239_ΔGY' & data$challenge.tp == FALSE),]$Animal.No.)) {
+  #print(i)
+  #subset wrt Animal.No. and first 20 weeks
+  temp.df.merging <- data[which(data$challenge.tp == TRUE),c("week.timepoint", measurement,"Animal.No.")]
+  temp.df.merging <- temp.df.merging[which(temp.df.merging$Animal.No. == i),] 
+  temp.df.merging <- temp.df.merging[temp.df.merging$week.timepoint <= 20,]
+  #print(temp.df.merging)
+  # loess fit
+  fit <- loess(get(measurement) ~ week.timepoint, data = temp.df.merging)
+  # prediction of missing points
+  predictions.df <- data.frame(week.timepoint = seq(0,20,1))
+  pred <- data.frame(vl.pred = predict(fit, predictions.df))
+  pred$week.timepoint <- predictions.df$week.timepoint
+  
+  # assign to df
+  loess.pred.gy.after[,i] <- pred$vl.pred 
+}
+loess.pred.gy.after[loess.pred.gy.after <0] <- 0 #convert negative predictions to zero.
+
+# Forecast for NA values (GY after challenge)
+gy.after.challenge.cases <- c("LJ02", "LJ04", "LJ46", "LJ47", "MA18", "MA23") #LJ48 removed no measurement before challenge 
+
+for (i in gy.after.challenge.cases) {
+  print(i)
+  # calculate fit for forecast
+  forecast.fit <- auto.arima(loess.pred.gy.after[1:length(na.omit(loess.pred.gy.after[,i])),i], seasonal = FALSE)
+  # forecast
+  forecast.number <- nrow(loess.pred.gy.after) - length(na.omit(loess.pred.gy.after[,i]))
+  if (forecast.number == 0) {
+    next #skip this iteration (no need for forecasting for that sample)
+  }
+  loess.pred.forecast <- forecast(forecast.fit,forecast.number)
+  print(loess.pred.forecast$method)
+  # append forecast to initial values
+  full.set <- c(loess.pred.forecast$x, loess.pred.forecast$mean)
+  # assign to df
+  #print(i)
+  #print(length(full.set))
+  #print(full.set)
+  #print("-------")
+  #col.name.holder <- paste0(i, ".forecast")
+  loess.pred.gy.after[,i] <- full.set
+}
+loess.pred.gy.after[loess.pred.gy.after <0] <- 0 #convert negative predictions to zero.
+long.holder.gy <- pivot_longer(loess.pred.gy.after, cols=-week.timepoint)
+colnames(long.holder.gy) <- c("week.timepoint", "Animal.No.", measurement)
+
+######### ROC calculation
+roc.df.gy <- data.frame(loess.pred.gy.after$week.timepoint,
+                    lapply(loess.pred.gy.after[,-1], function(x) c(NA, diff(x) / x[-length(x)] * 100)))
+colnames(roc.df.gy)[1] <- "week.timepoint"
+roc.gy.long.holder <- pivot_longer(roc.df.gy, cols=-week.timepoint)
+colnames(roc.gy.long.holder) <- c("week.timepoint", "Animal.No.", paste0("roc_",measurement))
+#########
+
+#add measurement to main df (data.vac)
+data.vac <- inner_join(data.vac, long.holder.gy, by = c("week.timepoint", "Animal.No."))
+
+#add roc to roc df (roc.vac)
+roc.vac <- inner_join(roc.vac, roc.gy.long.holder, by = c("week.timepoint", "Animal.No."))
+}
+```
+
+```{r}
+# Missing value handling
+roc.vac <- do.call(data.frame, lapply(roc.vac, function(x) replace(x, is.infinite(x), NA)))
+roc.vac[is.na(roc.vac)] <- 0
+```
+
+### Visualize absolute measurement and ROC feature
+
+```{r}
+ggplot(data[which(data$Animal.No. == "LJ04"),], aes(x= week.timepoint, y= TIgG_SIV.1.mac251)) + 
+  geom_line() + 
+  geom_point(data = data.vac[which(data.vac$Animal.No. == "LJ04"),], aes(x= week.timepoint, y= TIgG_SIV.1.mac251))
+```
+
+
+## vaccinated (before challenge)
+
+```{r}
+for (measurement in colnames(data)[c(5,11:203)]) {
+# fit a curve to the data using loess (∆GY, after challenge)
+# use the same set for the loop since LJ48 does not have data before challenge
+loess.pred.gy.after <- data.frame(week.timepoint = seq(0,20,1))
+
+for (i in unique(data[which(data$arm == 'SIVmac239_ΔGY' & data$challenge.tp == FALSE),]$Animal.No.)) {
+  #print(i)
+  #subset wrt Animal.No. and first 20 weeks
+  temp.df.merging <- data[which(data$challenge.tp == FALSE),c("week.timepoint", measurement,"Animal.No.")] # FALSE for before challenge
+  temp.df.merging <- temp.df.merging[which(temp.df.merging$Animal.No. == i),]
+  if (i == "LJ47") {
+    temp.df.merging <- temp.df.merging[temp.df.merging$week.timepoint <= 40,]
+    temp.df.merging[3,"week.timepoint"] <- 20
+  } else {
+      temp.df.merging <- temp.df.merging[temp.df.merging$week.timepoint <= 20,]
+  }
+  #print(temp.df.merging)
+  # loess fit
+  fit <- loess(get(measurement) ~ week.timepoint, data = temp.df.merging)
+  # prediction of missing points
+  predictions.df <- data.frame(week.timepoint = seq(0,20,1))
+  pred <- data.frame(vl.pred = predict(fit, predictions.df))
+  pred$week.timepoint <- predictions.df$week.timepoint
+  
+  # assign to df
+  loess.pred.gy.after[,i] <- pred$vl.pred 
+}
+loess.pred.gy.after[loess.pred.gy.after <0] <- 0 #convert negative predictions to zero.
+
+# Forecast for NA values (GY after challenge)
+gy.after.challenge.cases <- c("LJ02", "LJ04", "LJ46", "LJ47", "MA18", "MA23") #LJ48 removed no measurement before challenge 
+
+for (i in gy.after.challenge.cases) {
+  print(i)
+  # calculate fit for forecast
+  forecast.fit <- auto.arima(loess.pred.gy.after[1:length(na.omit(loess.pred.gy.after[,i])),i], seasonal = FALSE)
+  # forecast
+  forecast.number <- nrow(loess.pred.gy.after) - length(na.omit(loess.pred.gy.after[,i]))
+  if (forecast.number == 0) {
+    next #skip this iteration (no need for forecasting for that sample)
+  }
+  loess.pred.forecast <- forecast(forecast.fit,forecast.number)
+  print(loess.pred.forecast$method)
+  # append forecast to initial values
+  full.set <- c(loess.pred.forecast$x, loess.pred.forecast$mean)
+  # assign to df
+  #print(i)
+  #print(length(full.set))
+  #print(full.set)
+  #print("-------")
+  #col.name.holder <- paste0(i, ".forecast")
+  loess.pred.gy.after[,i] <- full.set
+}
+loess.pred.gy.after[loess.pred.gy.after <0] <- 0 #convert negative predictions to zero.
+long.holder.gy <- pivot_longer(loess.pred.gy.after, cols=-week.timepoint)
+colnames(long.holder.gy) <- c("week.timepoint", "Animal.No.", measurement)
+
+######### ROC calculation
+roc.df.gy <- data.frame(loess.pred.gy.after$week.timepoint,
+                    lapply(loess.pred.gy.after[,-1], function(x) c(NA, diff(x) / x[-length(x)] * 100)))
+colnames(roc.df.gy)[1] <- "week.timepoint"
+roc.gy.long.holder <- pivot_longer(roc.df.gy, cols=-week.timepoint)
+colnames(roc.gy.long.holder) <- c("week.timepoint", "Animal.No.", paste0("roc_",measurement))
+#########
+
+#add measurement to main df (data.vac)
+data.vac <- inner_join(data.vac, long.holder.gy, by = c("week.timepoint", "Animal.No."))
+
+#add roc to roc df (roc.vac)
+roc.vac <- inner_join(roc.vac, roc.gy.long.holder, by = c("week.timepoint", "Animal.No."))
+}
+```
+
+```{r}
+# Missing value handling
+roc.vac <- do.call(data.frame, lapply(roc.vac, function(x) replace(x, is.infinite(x), NA)))
+roc.vac[is.na(roc.vac)] <- 0
+```
+
+### Visualize absolute measurement and ROC feature
+
+```{r}
+ggplot(data[which(data$Animal.No. == "LJ04"),], aes(x= week.timepoint, y= TIgG_SIV.1.mac251)) + 
+  geom_line() + 
+  geom_point(data = data.vac[which(data.vac$Animal.No. == "LJ04"),], aes(x= week.timepoint, y= TIgG_SIV.1.mac251))
+```
+# Dataframe for all ROC features
+
+```{r}
+# Put all predicted measurements in a single df
+#roc.after.challenge <- rbind(roc.naive, roc.vac)
+roc.after.challenge <- roc.vac
+
+# add group info (vac or naive)
+roc.after.challenge$arm <- data[match(roc.after.challenge$Animal.No., data$Animal.No.), "arm"]
+roc.after.challenge <- roc.after.challenge[,c("Animal.No.", "arm", "week.timepoint", colnames(roc.after.challenge)[3:196])]
+
+# Inf or NA values
+roc.after.challenge <- do.call(data.frame, lapply(roc.after.challenge, function(x) replace(x, is.infinite(x), NA)))
+roc.after.challenge[is.na(roc.after.challenge)] <- 0
+```
+
+```{r}
+# merge with the absolute measurements
+roc.after.challenge <- bind_cols(data.vac, roc.after.challenge[,c(4:197)])
+```
+
+```{r}
+# save predictions
+#write.csv(roc.after.challenge, "gy_before_measurement_roc_20weeks.csv", row.names = FALSE)
+```
+

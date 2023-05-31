@@ -1,0 +1,905 @@
+---
+title: "AUC calculation"
+output: html_document
+date: "2022-11-03"
+---
+
+This script is for the AUC calculation under viral load curves.
+
+1) ∆GY until week 20 (before challenge) vs naive until week20
+2) ∆GY (after challenge) until week 20 vs naive until week20
+
+Samples are not collected on same timepoints. Therefore, we need to use a smooth line and predict in between viral loads.
+
+# Load libraries
+```{r echo=FALSE}
+library(dplyr)
+library(corrplot)
+library(glmnet) #lasso
+library(ggplot2)
+library(tibble)
+library(pROC) #auc
+library(corrr)
+library(tidyverse)
+library(forecast) #arima forecast
+library(stats)
+library(zoo) #rollmean
+library(ggpubr)
+library(rstatix)
+```
+
+# Load raw data
+```{r}
+# Load data
+data <- read.csv("../data/nv.csv")
+#View(data)
+```
+
+# Preprocessing for timepoints
+Timepoint labels are not in order. Different labels are used for a same sample. For example, "6 wk PI" and "E660 Challenge 6 wk" indicate the same time point. Also, different scales are used such as day and week.
+
+## Convert to day 
+The following chunk fixes this problem by producing day timepoints for all samples.
+```{r}
+#Adding a new time point column
+data_first <- data[,1:6]
+data_last <- data[7:200]
+data_first$Day_timepoint <- data_first$tp
+data <- cbind(data_first, data_last)
+#View(data)
+
+# String to Numeric
+data$Day_timepoint <- ifelse(data$Day_timepoint == "Pre", 0, data$Day_timepoint)
+data$Day_timepoint <- gsub("E660 Challenge ", "", data$Day_timepoint)
+data$Day_timepoint <- gsub(" wk", "", data$Day_timepoint)
+data$Day_timepoint <- gsub("wk ", "", data$Day_timepoint)
+data$Day_timepoint <- as.numeric(data$Day_timepoint)
+data$Day_timepoint <- data$Day_timepoint * 7
+data$Day_timepoint <- ifelse(is.na(data$Day_timepoint), data$tp, data$Day_timepoint)
+data$Day_timepoint <- gsub("E660 Challenge ", "", data$Day_timepoint)
+data$Day_timepoint <- gsub(" Day", "", data$Day_timepoint)
+data$Day_timepoint <- gsub(" day", "", data$Day_timepoint)
+data$Day_timepoint <- as.numeric(data$Day_timepoint)
+```
+
+## Convert to week
+Week scale can be better for the interpretation. 
+```{r}
+week.timepoint <- ceiling(data$Day_timepoint / 7)
+data <- cbind(data[,1:7], week.timepoint, data[,8:201])
+```
+
+## Binary feature for challenge timepoints
+After challenge timepoints also starts from 0. Create a variable to indicate challenge time points.
+```{r}
+challenge.tp <- grepl("Challenge", data$tp)
+# add to the data
+data <- cbind(data[1:8], challenge.tp, data[9:202])
+```
+
+## QC 
+```{r}
+#Timepoints
+naive.samples <- data[which(data$arm == 'naive'),]
+sort.int(unique(naive.samples$week.timepoint)) #naive
+gy.samples <- data[which(data$arm == 'SIVmac239_ΔGY'),]
+sort.int(unique(gy.samples$week.timepoint)) #deltaGY
+
+#Frequency of timepoints
+table(naive.samples$week.timepoint)
+table(gy.samples$week.timepoint)
+```
+
+# Preprocessing for duplicates
+A few samples have technical replicates. 
+
+```{r}
+# Identify duplicate rows
+duplicate.rows <- duplicated(data[,c("Animal.No.", "week.timepoint", "challenge.tp")])
+
+# Remove duplicated rows
+data <- data[!duplicate.rows,] 
+```
+
+# Predict missing values for AUC
+Following "viral.load.auc" dataframes are for the visualization of timepoints at which there is a initial measurement.
+
+## Naive
+```{r}
+# new dataframe for viral loads
+viral.load.auc <- data.frame(week.timepoint = seq(0,20))
+# assign week values
+#viral.load.auc$week.timepoint <- seq(0,20)
+
+# naive cases
+for (i in unique(data[which(data$arm == 'naive'),]$Animal.No.)) {
+  print(i)
+  # subset animals for merging
+  temp.df.merging <- data[which(data$Animal.No. == i),c("week.timepoint","RNACopies.ml")]
+  colnames(temp.df.merging) <- c("week.timepoint",i)
+  
+  temp.df.merging <- temp.df.merging[temp.df.merging$week.timepoint <=20,]
+  
+  # assign initial viral loads
+  viral.load.auc <- merge(viral.load.auc, temp.df.merging, by = "week.timepoint", all = TRUE)
+  #viral.load.auc[,i] <- viral.load.auc$RNACopies.ml # assign RNA values to the corresponding animal.no. column
+  #viral.load.auc <- viral.load.auc[,-13] #drop RNACopies.ml column
+}
+```
+
+## GY before challenge
+```{r}
+# new dataframe for viral loads
+viral.load.auc.gy.before <- data.frame(week.timepoint = seq(0,20))
+# assign week values
+#viral.load.auc$week.timepoint <- seq(0,20)
+
+gy.before.challenge.cases <- c("LJ02", "LJ04", "LJ46", "LJ47", "MA18", "MA23") #LJ48 removed no measurement before challenge 
+
+# gy cases
+for (i in gy.before.challenge.cases) {
+  print(i)
+  # subset animals for merging
+  temp.df.merging <- data[which(data$challenge.tp == FALSE),c("week.timepoint","RNACopies.ml","Animal.No.", "challenge.tp")]
+  
+  temp.df.merging <- temp.df.merging[which(temp.df.merging$Animal.No. == i),]
+  temp.df.merging <- temp.df.merging[,c("week.timepoint","RNACopies.ml")]
+  #print(temp.df.merging)
+  colnames(temp.df.merging) <- c("week.timepoint",i)
+  temp.df.merging <- temp.df.merging[temp.df.merging$week.timepoint <= 20,]
+  
+  # assign initial viral loads
+  viral.load.auc.gy.before <- merge(viral.load.auc.gy.before, temp.df.merging, by = "week.timepoint", all = TRUE)
+  #viral.load.auc[,i] <- viral.load.auc$RNACopies.ml # assign RNA values to the corresponding animal.no. column
+  #viral.load.auc <- viral.load.auc[,-13] #drop RNACopies.ml column
+}
+```
+
+## GY after challenge
+```{r}
+# new dataframe for viral loads
+viral.load.auc.gy.after <- data.frame(week.timepoint = seq(0,20))
+# assign week values
+#viral.load.auc$week.timepoint <- seq(0,20)
+
+gy.after.challenge.cases <- c("LJ02", "LJ04", "LJ46", "LJ47", "MA18", "MA23") #LJ48 removed no measurement before challenge 
+
+# gy cases
+for (i in gy.after.challenge.cases) {
+  print(i)
+  # subset animals for merging
+  temp.df.merging <- data[which(data$challenge.tp == TRUE),c("week.timepoint","RNACopies.ml","Animal.No.", "challenge.tp")]
+  
+  temp.df.merging <- temp.df.merging[which(temp.df.merging$Animal.No. == i),]
+  temp.df.merging <- temp.df.merging[,c("week.timepoint","RNACopies.ml")]
+  #print(temp.df.merging)
+  colnames(temp.df.merging) <- c("week.timepoint",i)
+  temp.df.merging <- temp.df.merging[temp.df.merging$week.timepoint <= 20,]
+  
+  # assign initial viral loads
+  viral.load.auc.gy.after <- merge(viral.load.auc.gy.after, temp.df.merging, by = "week.timepoint", all = TRUE)
+  #viral.load.auc[,i] <- viral.load.auc$RNACopies.ml # assign RNA values to the corresponding animal.no. column
+  #viral.load.auc <- viral.load.auc[,-13] #drop RNACopies.ml column
+}
+
+```
+# Curve fitting (LOESS)
+```{r}
+# fit a curve to the data using loess (naive)
+loess.pred <- data.frame(week.timepoint = seq(0,20,1))
+
+for (i in unique(data[which(data$arm == 'naive'),]$Animal.No.)) {
+  #print(i)
+  #subset wrt Animal.No. and first 20 weeks
+  temp.df.merging <- data[which(data$Animal.No. == i),c("week.timepoint","RNACopies.ml")]
+  temp.df.merging <- temp.df.merging[temp.df.merging$week.timepoint <= 20,]
+  # loess fit
+  fit <- loess(RNACopies.ml ~ week.timepoint, data = temp.df.merging)
+  # prediction of missing points
+  predictions.df <- data.frame(week.timepoint = seq(0,20,1))
+  pred <- data.frame(vl.pred = predict(fit, predictions.df))
+  pred$week.timepoint <- predictions.df$week.timepoint
+  
+  # assign to df
+  loess.pred[,i] <- pred$vl.pred 
+}
+
+# fit a curve to the data using loess (∆GY, before challenge)
+loess.pred.gy.before <- data.frame(week.timepoint = seq(0,20,1))
+gy.before.challenge.cases <- c("LJ02", "LJ04", "LJ46", "LJ47", "MA18", "MA23") #LJ48 removed no measurement before challenge 
+for (i in gy.before.challenge.cases) {
+  #print(i)
+  # subset animals for merging
+  temp.df.merging <- data[which(data$challenge.tp == FALSE),c("week.timepoint","RNACopies.ml","Animal.No.", "challenge.tp")]
+  temp.df.merging <- temp.df.merging[which(temp.df.merging$Animal.No. == i),]
+  temp.df.merging <- temp.df.merging[,c("week.timepoint","RNACopies.ml")]
+  #print(temp.df.merging)
+  temp.df.merging <- temp.df.merging[temp.df.merging$week.timepoint <= 40,]
+  # loess fit
+  fit <- loess(RNACopies.ml ~ week.timepoint, data = temp.df.merging)
+  # prediction of missing points
+  predictions.df <- data.frame(week.timepoint = seq(0,20,1))
+  pred <- data.frame(vl.pred = predict(fit, predictions.df))
+  pred$week.timepoint <- predictions.df$week.timepoint
+  
+  # assign to df
+  loess.pred.gy.before[,i] <- pred$vl.pred 
+}
+loess.pred.gy.before[loess.pred.gy.before < 0] <- 0 #convert negative predictions to zero. 
+
+# fit a curve to the data using loess (∆GY, after challenge)
+# use the same set for the loop since LJ48 does not have data before challenge
+loess.pred.gy.after <- data.frame(week.timepoint = seq(0,20,1))
+
+for (i in unique(data[which(data$arm == 'SIVmac239_ΔGY' & data$challenge.tp == FALSE),]$Animal.No.)) {
+  #print(i)
+  #subset wrt Animal.No. and first 20 weeks
+  temp.df.merging <- data[which(data$challenge.tp == TRUE),c("week.timepoint","RNACopies.ml","Animal.No.")]
+  temp.df.merging <- temp.df.merging[which(temp.df.merging$Animal.No. == i),] 
+  temp.df.merging <- temp.df.merging[temp.df.merging$week.timepoint <= 20,]
+  #print(temp.df.merging)
+  # loess fit
+  fit <- loess(RNACopies.ml ~ week.timepoint, data = temp.df.merging)
+  # prediction of missing points
+  predictions.df <- data.frame(week.timepoint = seq(0,20,1))
+  pred <- data.frame(vl.pred = predict(fit, predictions.df))
+  pred$week.timepoint <- predictions.df$week.timepoint
+  
+  # assign to df
+  loess.pred.gy.after[,i] <- pred$vl.pred 
+}
+loess.pred.gy.after[loess.pred.gy.after <0] <- 0 #convert negative predictions to zero.
+```
+
+# Forecasting 
+ARIMA is used.
+```{r}
+# Forecast for NA values (naive)
+for (i in unique(data[which(data$arm == 'naive'),]$Animal.No.)) {
+  #print(i)
+  # calculate fit for forecast
+  forecast.fit <- auto.arima(loess.pred[1:length(na.omit(loess.pred[,i])),i], seasonal = FALSE)
+  # forecast
+  forecast.number <- nrow(loess.pred) - length(na.omit(loess.pred[,i]))
+  loess.pred.forecast <- forecast(forecast.fit,forecast.number)
+  print(loess.pred.forecast$method)
+  # append forecast to initial values
+  full.set <- c(loess.pred.forecast$x, loess.pred.forecast$mean)
+  # assign to df
+  #print(i)
+  #print(length(full.set))
+  #print(full.set)
+  #print("-------")
+  col.name.holder <- paste0(i, ".forecast")
+  loess.pred[,col.name.holder] <- full.set
+}
+
+#autoplot(loess.pred.forecast)
+```
+No need to forecast for NA values in GY before challenge cases. All required values were predicted.
+
+```{r}
+# Forecast for NA values (GY after challenge)
+gy.after.challenge.cases <- c("LJ02", "LJ04", "LJ46", "LJ47", "MA18", "MA23") #LJ48 removed no measurement before challenge 
+
+for (i in gy.after.challenge.cases) {
+  print(i)
+  # calculate fit for forecast
+  forecast.fit <- auto.arima(loess.pred.gy.after[1:length(na.omit(loess.pred.gy.after[,i])),i], seasonal = FALSE)
+  # forecast
+  forecast.number <- nrow(loess.pred.gy.after) - length(na.omit(loess.pred.gy.after[,i]))
+  if (forecast.number == 0) {
+    next #skip this iteration (no need for forecasting for that sample)
+  }
+  loess.pred.forecast <- forecast(forecast.fit,forecast.number)
+  print(loess.pred.forecast$method)
+  # append forecast to initial values
+  full.set <- c(loess.pred.forecast$x, loess.pred.forecast$mean)
+  # assign to df
+  #print(i)
+  #print(length(full.set))
+  #print(full.set)
+  #print("-------")
+  col.name.holder <- paste0(i, ".forecast")
+  loess.pred.gy.after[,col.name.holder] <- full.set
+}
+loess.pred.gy.after[loess.pred.gy.after <0] <- 0 #convert negative predictions to zero.
+#autoplot(loess.pred.forecast)
+```
+
+# Visualizing via ggplot 
+Visualize curve fitting and forecasting.
+## Naive
+```{r}
+#LI98
+plot.naive1 <- ggplot(na.omit(viral.load.auc[,c(1,2)]), aes(x= week.timepoint, y= LI98)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= LI98.forecast),color = 'green2', size=1) +
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= LI98),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("Viral load (RNA Copies / mL)") +
+  ggtitle("LI98 (Naive)") +
+  theme_minimal()
+
+#MA19
+plot.naive2 <- ggplot(na.omit(viral.load.auc[,c(1,3)]), aes(x= week.timepoint, y= MA19)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA19.forecast),color = 'green2', size=1) +
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA19),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("Viral load (RNA Copies / mL)") +
+  ggtitle("MA19 (Naive)") +
+  theme_minimal()
+
+#MA20
+plot.naive3 <- ggplot(na.omit(viral.load.auc[,c(1,4)]), aes(x= week.timepoint, y= MA20)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA20.forecast),color = 'green2', size=1) +
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA20),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("Viral load (RNA Copies / mL)") +
+  ggtitle("MA20 (Naive)") +
+  theme_minimal()
+
+#MA25
+plot.naive4 <- ggplot(na.omit(viral.load.auc[,c(1,5)]), aes(x= week.timepoint, y= MA25)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA25.forecast),color = 'green2', size=1) +
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA25),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("Viral load (RNA Copies / mL)") +
+  ggtitle("MA25 (Naive)") + 
+  theme_minimal()
+
+#MA39
+plot.naive5 <- ggplot(na.omit(viral.load.auc[,c(1,6)]), aes(x= week.timepoint, y= MA39)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA39.forecast),color = 'green2', size=1) +
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA39),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("RNA Copies / mL") +
+  ggtitle("MA39 (Naive)") +
+  theme_minimal()
+
+plot.naive1
+plot.naive2
+plot.naive3
+plot.naive4
+plot.naive5
+
+# Save figure
+#ggsave("naive_li98_curve_forecast.jpg", plot.naive1, width = 6, height = 4, dpi = 300)
+#ggsave("naive_ma19_curve_forecast.jpg", plot.naive2, width = 6, height = 4, dpi = 300)
+#ggsave("naive_ma20_curve_forecast.jpg", plot.naive3, width = 6, height = 4, dpi = 300)
+#ggsave("naive_ma25_curve_forecast.jpg", plot.naive4, width = 6, height = 4, dpi = 300)
+#ggsave("naive_ma39_curve_forecast.jpg", plot.naive5, width = 6, height = 4, dpi = 300)
+```
+## GY after challenge 
+```{r}
+#LJ02
+plot.after.challenge1 <- ggplot(na.omit(viral.load.auc.gy.after[,c(1,2)]), aes(x= week.timepoint, y= LJ02)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  #geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= MA23.forecast),color = 'green') + # this line is for forecast values. Some animals don't have forecast. Check viral.load.auc.gy.after 
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= LJ02),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("RNA Copies / mL") +
+  ggtitle("LJ02 (∆GY after challenge)") + 
+  theme_minimal()
+
+#LJ04
+plot.after.challenge2 <- ggplot(na.omit(viral.load.auc.gy.after[,c(1,3)]), aes(x= week.timepoint, y= LJ04)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= LJ04.forecast),color = 'green2', size=1) + # this line is for forecast values. Some animals don't have forecast. Check viral.load.auc.gy.after 
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= LJ04),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("RNA Copies / mL") +
+  ggtitle("LJ04 (∆GY after challenge)") + 
+  theme_minimal()
+
+#LJ46
+plot.after.challenge3 <- ggplot(na.omit(viral.load.auc.gy.after[,c(1,4)]), aes(x= week.timepoint, y= LJ46)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  #geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= LJ46.forecast),color = 'green2', size=1) + # this line is for forecast values. Some animals don't have forecast. Check viral.load.auc.gy.after 
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= LJ46),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("RNA Copies / mL") +
+  ggtitle("LJ46 (∆GY after challenge)") + 
+  theme_minimal()
+
+#LJ47
+plot.after.challenge4 <- ggplot(na.omit(viral.load.auc.gy.after[,c(1,5)]), aes(x= week.timepoint, y= LJ47)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  #geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= LJ04.forecast),color = 'green2', size=1) + # this line is for forecast values. Some animals don't have forecast. Check viral.load.auc.gy.after 
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= LJ47),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("RNA Copies / mL") +
+  ggtitle("LJ47 (∆GY after challenge)") + 
+  theme_minimal()
+
+#MA18
+plot.after.challenge5 <- ggplot(na.omit(viral.load.auc.gy.after[,c(1,6)]), aes(x= week.timepoint, y= MA18)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= MA18.forecast),color = 'green2', size=1) + # this line is for forecast values. Some animals don't have forecast. Check viral.load.auc.gy.after 
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= MA18),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("RNA Copies / mL") +
+  ggtitle("MA18 (∆GY after challenge)") + 
+  theme_minimal()
+
+#MA23
+plot.after.challenge6 <- ggplot(na.omit(viral.load.auc.gy.after[,c(1,7)]), aes(x= week.timepoint, y= MA23)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= MA23.forecast),color = 'green2', size=1) + # this line is for forecast values. Some animals don't have forecast. Check viral.load.auc.gy.after 
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= MA23),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("RNA Copies / mL") +
+  ggtitle("MA23 (∆GY after challenge)") + 
+  theme_minimal()
+
+
+plot.after.challenge1
+plot.after.challenge2
+plot.after.challenge3
+plot.after.challenge4
+plot.after.challenge5
+plot.after.challenge6
+# Save figure
+#ggsave("gy_after_lj02_curve_forecast.jpg", plot.after.challenge1, width = 6, height = 4, dpi = 300)
+#ggsave("gy_after_lj04_curve_forecast.jpg", plot.after.challenge2, width = 6, height = 4, dpi = 300)
+#ggsave("gy_after_lj46_curve_forecast.jpg", plot.after.challenge3, width = 6, height = 4, dpi = 300)
+#ggsave("gy_after_lj47_curve_forecast.jpg", plot.after.challenge4, width = 6, height = 4, dpi = 300)
+#ggsave("gy_after_ma18_curve_forecast.jpg", plot.after.challenge5, width = 6, height = 4, dpi = 300)
+#ggsave("gy_after_ma23_curve_forecast.jpg", plot.after.challenge6, width = 6, height = 4, dpi = 300)
+```
+## GY before challenge
+```{r}
+#LJ02
+plot.before.challenge1 <- ggplot(na.omit(viral.load.auc.gy.before[,c(1,2)]), aes(x= week.timepoint, y= LJ02)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= LJ02),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("RNA Copies / mL") +
+  ggtitle("LJ02 (∆GY before challenge)") + 
+  theme_minimal()
+
+#LJ04
+plot.before.challenge2 <- ggplot(na.omit(viral.load.auc.gy.before[,c(1,3)]), aes(x= week.timepoint, y= LJ04)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= LJ04),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("RNA Copies / mL") +
+  ggtitle("LJ04 (∆GY before challenge)") + 
+  theme_minimal()
+
+#LJ46
+plot.before.challenge3 <- ggplot(na.omit(viral.load.auc.gy.before[,c(1,4)]), aes(x= week.timepoint, y= LJ46)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= LJ46),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("RNA Copies / mL") +
+  ggtitle("LJ46 (∆GY before challenge)") + 
+  theme_minimal()
+
+#LJ47
+plot.before.challenge4 <- ggplot(na.omit(viral.load.auc.gy.before[,c(1,5)]), aes(x= week.timepoint, y= LJ47)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= LJ47),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("RNA Copies / mL") +
+  ggtitle("LJ47 (∆GY before challenge)") + 
+  theme_minimal()
+
+#MA18
+plot.before.challenge5 <- ggplot(na.omit(viral.load.auc.gy.before[,c(1,6)]), aes(x= week.timepoint, y= MA18)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= MA18),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("RNA Copies / mL") +
+  ggtitle("MA18 (∆GY before challenge)") + 
+  theme_minimal()
+
+#MA23
+plot.before.challenge6 <- ggplot(na.omit(viral.load.auc.gy.before[,c(1,7)]), aes(x= week.timepoint, y= MA23)) +
+  geom_point(fill = "black", shape = 21, size = 3) +
+  geom_smooth(method = 'lm', se = FALSE, alpha =0.3, color = 'orange', linetype = 'dashed') +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = 'red2', alpha = 0.3, linetype= 'dotted') + 
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= MA23),color = 'blue2', size=1) +
+  xlab("Week") +
+  ylab("RNA Copies / mL") +
+  ggtitle("MA23 (∆GY before challenge)") + 
+  theme_minimal()
+
+
+plot.before.challenge1
+plot.before.challenge2
+plot.before.challenge3
+plot.before.challenge4
+plot.before.challenge5
+plot.before.challenge6
+
+# Save figure
+#ggsave("gy_before_lj02_curve_forecast.jpg", plot.before.challenge1, width = 6, height = 4, dpi = 300)
+#ggsave("gy_before_lj04_curve_forecast.jpg", plot.before.challenge2, width = 6, height = 4, dpi = 300)
+#ggsave("gy_before_lj46_curve_forecast.jpg", plot.before.challenge3, width = 6, height = 4, dpi = 300)
+#ggsave("gy_before_lj47_curve_forecast.jpg", plot.before.challenge4, width = 6, height = 4, dpi = 300)
+#ggsave("gy_before_ma18_curve_forecast.jpg", plot.before.challenge5, width = 6, height = 4, dpi = 300)
+#ggsave("gy_before_ma23_curve_forecast.jpg", plot.before.challenge6, width = 6, height = 4, dpi = 300)
+```
+
+# Visualize AUC approximation
+
+## Naive
+```{r}
+#ma19
+df.trapezoid.ma19 <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred$MA19.forecast,2))
+plot.naive.auc.1 <- ggplot() +
+  geom_rect(data = df.trapezoid.ma19, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No. == 'MA19' & data$week.timepoint <= 20),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  theme_minimal()+
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA19.forecast),color = "green2", size = 1) +
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA19),color = "blue2", size = 1) +
+  xlab("Week") +
+  ylab("RNA Copies / mL")+
+  ggtitle("MA19 (Naive)")
+
+#ma20
+df.trapezoid.ma20 <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred$MA20.forecast,2))
+plot.naive.auc.2 <- ggplot() +
+  geom_rect(data = df.trapezoid.ma20, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No. == 'MA20' & data$week.timepoint <= 20),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA20.forecast),color = "green2", size = 1) +
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA20),color = "blue2", size = 1) +
+  theme_minimal()+
+  xlab("Week") +
+  ylab("RNA Copies / mL")+
+  ggtitle("MA20 (Naive)")
+
+#ma25
+df.trapezoid.ma25 <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred$MA25.forecast,2))
+plot.naive.auc.3 <- ggplot() +
+  geom_rect(data = df.trapezoid.ma25, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No.== 'MA25' & data$week.timepoint <= 20),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA25.forecast),color = "green2", size = 1) +
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA25),color = "blue2", size = 1) +
+  xlab("Week") +
+  theme_minimal()+
+  ylab("RNA Copies / mL")+
+  ggtitle("MA25 (Naive)")
+
+#ma39
+df.trapezoid.ma39 <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred$MA39.forecast,2))
+plot.naive.auc.4 <- ggplot() +
+  geom_rect(data = df.trapezoid.ma39, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No.== 'MA39' & data$week.timepoint <= 20),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA39.forecast),color = "green2", size = 1) +
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= MA39),color = "blue2", size = 1) +
+  theme_minimal()+
+  xlab("Week") +
+  ylab("RNA Copies / mL")+
+  ggtitle("MA39 (Naive)")
+
+#li98
+df.trapezoid.li98 <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred$LI98.forecast,2))
+plot.naive.auc.5 <- ggplot() +
+  geom_rect(data = df.trapezoid.li98, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No.== 'LI98' & data$week.timepoint <= 20),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= LI98.forecast),color = "green2", size = 1) +
+  geom_line(data = loess.pred, aes(x=week.timepoint, y= LI98),color = "blue2", size = 1) +
+  theme_minimal()+
+  xlab("Week") +
+  ylab("RNA Copies / mL")+
+  ggtitle("LJ98 (Naive)")
+
+
+plot.naive.auc.1
+plot.naive.auc.2
+plot.naive.auc.3
+plot.naive.auc.4
+plot.naive.auc.5
+
+# Save plots
+#ggsave("naive_lj98_auc.jpg", plot.naive.auc.1, width = 6, height = 4, dpi = 300)
+#ggsave("naive_ma19_auc.jpg", plot.naive.auc.2, width = 6, height = 4, dpi = 300)
+#ggsave("naive_ma20_auc.jpg", plot.naive.auc.3, width = 6, height = 4, dpi = 300)
+#ggsave("naive_ma25_auc.jpg", plot.naive.auc.4, width = 6, height = 4, dpi = 300)
+#ggsave("naive_ma39_auc.jpg", plot.naive.auc.5, width = 6, height = 4, dpi = 300)
+```
+## GY before challenge
+```{r}
+#ma18
+df.trapezoid.ma18.bfr <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred.gy.before$MA18,2))
+plot.gy.before.auc.1 <- ggplot() +
+  geom_rect(data = df.trapezoid.ma18.bfr, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No. == 'MA18' & data$week.timepoint <= 20 & data$challenge.tp == FALSE),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= MA18),color = "green2", size = 1) +
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= MA18),color = "blue2", size = 1) +
+  xlab("Week") +
+  theme_minimal()+
+  ylab("RNA Copies / mL")+
+  ggtitle("MA18 (∆GY before challenge)")
+
+#ma23
+df.trapezoid.ma23.bfr <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred.gy.before$MA23,2))
+plot.gy.before.auc.2 <- ggplot() +
+  geom_rect(data = df.trapezoid.ma23.bfr, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No. == 'MA23' & data$week.timepoint <= 20 & data$challenge.tp == FALSE),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= MA23),color = "green2", size = 1) +
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= MA23),color = "blue2", size = 1) +
+  xlab("Week") +
+  theme_minimal()+
+  ylab("RNA Copies / mL")+
+  ggtitle("MA23 (∆GY before challenge)")
+
+#lj02
+df.trapezoid.lj02.bfr <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred.gy.before$LJ02,2))
+plot.gy.before.auc.3 <- ggplot() +
+  geom_rect(data = df.trapezoid.lj02.bfr, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No. == 'LJ02' & data$week.timepoint <= 20 & data$challenge.tp == FALSE),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= LJ02),color = "green2", size = 1) +
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= LJ02),color = "blue2", size = 1) +
+  xlab("Week") +
+  theme_minimal()+
+  ylab("RNA Copies / mL")+
+  ggtitle("LJ02 (∆GY before challenge)")
+
+#lj04
+df.trapezoid.lj04.bfr <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred.gy.before$LJ04,2))
+plot.gy.before.auc.4 <- ggplot() +
+  geom_rect(data = df.trapezoid.lj04.bfr, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No. == 'LJ04' & data$week.timepoint <= 20 & data$challenge.tp == FALSE),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= LJ04),color = "green2", size = 1) +
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= LJ04),color = "blue2", size = 1) +
+  xlab("Week") +
+  theme_minimal()+
+  ylab("RNA Copies / mL")+
+  ggtitle("LJ04 (∆GY before challenge)")
+
+#lj46
+df.trapezoid.lj46.bfr <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred.gy.before$LJ46,2))
+plot.gy.before.auc.5 <- ggplot() +
+  geom_rect(data = df.trapezoid.lj46.bfr, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No. == 'LJ46' & data$week.timepoint <= 20 & data$challenge.tp == FALSE),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= LJ46),color = "green2", size = 1) +
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= LJ46),color = "blue2", size = 1) +
+  xlab("Week") +
+  theme_minimal()+
+  ylab("RNA Copies / mL")+
+  ggtitle("LJ46 (∆GY before challenge)")
+
+#lj47
+df.trapezoid.lj47.bfr <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred.gy.before$LJ47,2))
+plot.gy.before.auc.6 <- ggplot() +
+  geom_rect(data = df.trapezoid.lj47.bfr, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No. == 'LJ47' & data$week.timepoint <= 20 & data$challenge.tp == FALSE),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= LJ47),color = "green2", size = 1) +
+  geom_line(data = loess.pred.gy.before, aes(x=week.timepoint, y= LJ47),color = "blue2", size = 1) +
+  xlab("Week") +
+  theme_minimal()+
+  ylab("RNA Copies / mL")+
+  ggtitle("LJ47 (∆GY before challenge)")
+
+
+plot.gy.before.auc.1
+plot.gy.before.auc.2
+plot.gy.before.auc.3
+plot.gy.before.auc.4
+plot.gy.before.auc.5
+plot.gy.before.auc.6
+
+# Save plots
+#ggsave("gy_before_ma18_auc.jpg", plot.gy.before.auc.1, width = 6, height = 4, dpi = 300)
+#ggsave("gy_before_ma23_auc.jpg", plot.gy.before.auc.2, width = 6, height = 4, dpi = 300)
+#ggsave("gy_before_lj02_auc.jpg", plot.gy.before.auc.3, width = 6, height = 4, dpi = 300)
+#ggsave("gy_before_lj04_auc.jpg", plot.gy.before.auc.4, width = 6, height = 4, dpi = 300)
+#ggsave("gy_before_lj46_auc.jpg", plot.gy.before.auc.5, width = 6, height = 4, dpi = 300)
+#ggsave("gy_before_lj47_auc.jpg", plot.gy.before.auc.6, width = 6, height = 4, dpi = 300)
+```
+## GY after challenge
+```{r}
+#ma18
+df.trapezoid.ma18.aft <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred.gy.after$MA18.forecast,2))
+plot.gy.after.auc.1 <- ggplot() +
+  geom_rect(data = df.trapezoid.ma18.aft, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No. == 'MA18' & data$week.timepoint <= 20 & data$challenge.tp == TRUE),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= MA18.forecast),color = "green2", size = 1) +
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= MA18),color = "blue2", size = 1) +
+  xlab("Week") +
+  theme_minimal()+
+  ylab("RNA Copies / mL")+
+  ggtitle("MA18 (∆GY after challenge)")
+
+#ma23
+df.trapezoid.ma23.aft <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred.gy.after$MA23.forecast,2))
+plot.gy.after.auc.2 <- ggplot() +
+  geom_rect(data = df.trapezoid.ma23.aft, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No. == 'MA23' & data$week.timepoint <= 20 & data$challenge.tp == TRUE),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= MA23.forecast),color = "green2", size = 1) +
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= MA23),color = "blue2", size = 1) +
+  xlab("Week") +
+  theme_minimal()+
+  ylab("RNA Copies / mL")+
+  ggtitle("MA23 (∆GY after challenge)")
+
+#lj02
+df.trapezoid.lj02.aft <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred.gy.after$LJ02,2))
+plot.gy.after.auc.3 <- ggplot() +
+  geom_rect(data = df.trapezoid.lj02.aft, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No. == 'LJ02' & data$week.timepoint <= 20 & data$challenge.tp == TRUE),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= LJ02),color = "green2", size = 1) +
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= LJ02),color = "blue2", size = 1) +
+  xlab("Week") +
+  theme_minimal()+
+  ylab("RNA Copies / mL")+
+  ggtitle("LJ02 (∆GY after challenge)")
+
+#lj04
+df.trapezoid.lj04.aft <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred.gy.after$LJ04.forecast,2))
+plot.gy.after.auc.4 <- ggplot() +
+  geom_rect(data = df.trapezoid.lj04.aft, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No. == 'LJ04' & data$week.timepoint <= 20 & data$challenge.tp == TRUE),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= LJ04.forecast),color = "green2", size = 1) +
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= LJ04),color = "blue2", size = 1) +
+  xlab("Week") +
+  theme_minimal()+
+  ylab("RNA Copies / mL")+
+  ggtitle("LJ04 (∆GY after challenge)")
+
+#lj46
+df.trapezoid.lj46.aft <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred.gy.after$LJ46,2))
+plot.gy.after.auc.5 <- ggplot() +
+  geom_rect(data = df.trapezoid.lj46.aft, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No. == 'LJ46' & data$week.timepoint <= 20 & data$challenge.tp == TRUE),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= LJ46),color = "green2", size = 1) +
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= LJ46),color = "blue2", size = 1) +
+  xlab("Week") +
+  theme_minimal()+
+  ylab("RNA Copies / mL")+
+  ggtitle("LJ46 (∆GY after challenge)")
+
+#lj47
+df.trapezoid.lj47.aft <- data.frame(x = 0:19, y.val= rep(0,length = 20), xend= 1:20, yend= rollmean(loess.pred.gy.after$LJ47,2))
+plot.gy.after.auc.6 <- ggplot() +
+  geom_rect(data = df.trapezoid.lj47.aft, aes(xmin = x, xmax = xend, ymin = y.val, ymax = yend), color = "black", fill = "#CC79A7", alpha = 0.2)+
+  geom_point(data = data[which(data$Animal.No. == 'LJ47' & data$week.timepoint <= 20 & data$challenge.tp == TRUE),c("week.timepoint","RNACopies.ml")], aes(x= week.timepoint, y= RNACopies.ml), fill = 'black', shape = 21, size = 3)+
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= LJ47),color = "green2", size = 1) +
+  geom_line(data = loess.pred.gy.after, aes(x=week.timepoint, y= LJ47),color = "blue2", size = 1) +
+  xlab("Week") +
+  theme_minimal()+
+  ylab("RNA Copies / mL")+
+  ggtitle("LJ47 (∆GY after challenge)")
+
+
+plot.gy.after.auc.1
+plot.gy.after.auc.2
+plot.gy.after.auc.3
+plot.gy.after.auc.4
+plot.gy.after.auc.5
+plot.gy.after.auc.6
+
+# Save plots
+#ggsave("gy_after_ma18_auc.jpg", plot.gy.after.auc.1, width = 6, height = 4, dpi = 300)
+#ggsave("gy_after_ma23_auc.jpg", plot.gy.after.auc.2, width = 6, height = 4, dpi = 300)
+#ggsave("gy_after_lj02_auc.jpg", plot.gy.after.auc.3, width = 6, height = 4, dpi = 300)
+#ggsave("gy_after_lj04_auc.jpg", plot.gy.after.auc.4, width = 6, height = 4, dpi = 300)
+#ggsave("gy_after_lj46_auc.jpg", plot.gy.after.auc.5, width = 6, height = 4, dpi = 300)
+#ggsave("gy_after_lj47_auc.jpg", plot.gy.after.auc.6, width = 6, height = 4, dpi = 300)
+```
+
+# Quantities for AUC 
+
+```{r}
+# Create new df that contains the complete set of viral loads (including curve fitted and forecasted values)
+all.viral.load <- cbind(
+  loess.pred[,c("week.timepoint", "LI98.forecast", "MA19.forecast","MA20.forecast","MA25.forecast","MA39.forecast")], 
+  loess.pred.gy.before[,c("LJ02", "LJ04", "LJ46", "LJ47", "MA18", "MA23")], 
+  loess.pred.gy.after[,c("LJ02", "LJ46", "LJ47","LJ04.forecast", "MA18.forecast", "MA23.forecast")])
+
+# Fix labeling
+colnames(all.viral.load) <- c("week.timepoint", "LI98.naive", "MA19.naive","MA20.naive","MA25.naive","MA39.naive",
+                              "LJ02.gy.before", "LJ04.gy.before", "LJ46.gy.before", "LJ47.gy.before", "MA18.gy.before",                                         
+                              "MA23.gy.before", "LJ02.gy.after", "LJ46.gy.after", "LJ47.gy.after","LJ04.gy.after",                                              
+                              "MA18.gy.after", "MA23.gy.after")
+
+
+```
+
+Formula: sum(diff(x)*rollmean(y,2))
+diff(x) is the same for all samples. (bin.width)
+```{r}
+# Make a df for putting auc values
+auc.df <- data.frame(group = c(rep("Naive", length = 5), rep("∆GY, before challenge", length = 6), rep("∆GY, after challenge", length = 6)), animal = colnames(all.viral.load)[2:18], auc = NA)
+# diff(x)
+bin.width <- diff(all.viral.load$week.timepoint)
+
+for (i in colnames(all.viral.load)[2:18]) {
+  #calculate auc
+  sum.integer.holder <- sum(bin.width*rollmean(all.viral.load[,i],2))
+  
+  # assign it to df
+  auc.df[which(auc.df$animal == i),"auc"] <- sum.integer.holder
+}
+
+auc.df$animal <- gsub(".gy.before", "", auc.df$animal)
+auc.df$animal <- gsub(".gy.after", "", auc.df$animal)
+auc.df$animal <- gsub(".naive", "", auc.df$animal)
+```
+
+#Scatterplot of AUC 
+```{r}
+# Mean values
+mean.df <- auc.df %>% group_by(group) %>% summarise(mean = mean(auc))
+
+#Plot
+scatterplot.auc <- ggplot(auc.df, aes(x=animal, y=auc, color= factor(group))) +
+  geom_point() +
+  #scale_x_discrete(labels = c("LI98", "LJ02", "LJ02", "LJ04", "LJ04", "LJ46", "LJ46", "LJ47", "LJ47", "MA18", "MA18",
+  #                            "MA19", "MA20", "MA20", "MA23", "MA23", "MA25", "MA25", "MA39")) +
+  theme_minimal()+theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_log10() +
+  geom_hline(data = mean.df, aes(yintercept = mean, color = factor(group)), linetype = 'dashed')+
+  labs(y = "AUC (log10 scale)", x = "") +
+  scale_color_discrete(name = "Group") # customize legend labels
+
+scatterplot.auc
+ #ggsave("scatterplot_auc.jpg", scatterplot.auc, width = 6, height = 4, dpi = 300)
+```
+# Boxplots of AUC   
+
+## Statistical test (Wilcox)
+```{r}
+# calculate significance (via wilcox test)
+stat.test <- auc.df %>% wilcox_test(auc ~ group)
+stat.test <- stat.test %>% add_xy_position(x = "group")
+stat.test$y.position <- c(10, 10.5, 11)
+```
+
+## Visualize AUC
+```{r}
+#pdf("AUC_boxplot.pdf", width = 3.7, height = 5)
+ggplot(auc.df, aes(x=group, y=auc)) +
+  geom_violin()+
+  geom_point(alpha = 0.4)+
+  #scale_x_discrete(labels = c("LI98", "LJ02", "LJ02", "LJ04", "LJ04", "LJ46", "LJ46", "LJ47", "LJ47", "MA18", "MA18",
+  #                            "MA19", "MA20", "MA20", "MA23", "MA23", "MA25", "MA25", "MA39")) +
+  scale_x_discrete(labels = c("deltaGY \n after challenge", "deltaGY \n before challenge", "naive"))+
+  theme_minimal()+theme(legend.position = "none") +
+  scale_y_log10() +
+  geom_point(data = mean.df, aes(y = mean), shape = "-", size = 5, color = "red3")+
+  labs(y = "log10(AUC)", x = "") +
+  #scale_color_discrete(name = "Group")+ # customize legend labels 
+  stat_pvalue_manual(stat.test, label = "p.adj.signif", tip.length = 0.01) # statistical comparison
+#dev.off()
+```
+

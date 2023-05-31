@@ -1,0 +1,109 @@
+---
+title: "Correlation Networks"
+output: html_document
+date: "2023"
+---
+
+```{r}
+#library(DMwR)
+library(ggpubr)
+library(ggsci)
+library(ggrepel)
+library(patchwork)
+library(paletteer)
+library(circlize)
+library(RColorBrewer)
+library(Hmisc)
+library(tidyverse)
+#library(ComplexHeatmap)
+library(network)
+library(stringr)
+```
+
+# Load data
+```{r}
+# Peak viral data
+data <- read_csv("../data/uniq_max_viral.csv")
+```
+
+# Preprocessing
+```{r}
+# EBOV is a control, biologically it is not interesting in correlation networks
+data.no.ebov <- select(data, -c(colnames(data[grepl("EBOV", colnames(data))])))
+```
+
+# Correlation Network figure
+```{r}
+# Correlation network
+#pred <- data.no.ebov[which(data$arm == "naive"), c(12:193)]
+pred <- data.no.ebov[which(data$arm == "SIVmac239_ΔGY"), c(12:193)]
+#pred <- X[,sel_features]
+
+res <- rcorr(as.matrix(pred), type = "pearson")
+
+resr <- as.data.frame(res$r)
+resr$selfeat <- row.names(resr)
+#print(resr$selfeat)
+#df.r <- subset(resr, resr$selfeat %in% sel_features)
+df.r <- resr
+
+resp <- as.data.frame(res$P)
+#View(resp)
+resp$selfeat <- row.names(resp)
+#df.p <- subset(resp, resr$selfeat %in% sel_features)
+df.p <- resp
+
+
+dfr <- df.r %>% gather(feature, rho, -c(selfeat))
+dfp <- df.p %>% gather(feature, p, -c(selfeat))
+dfp$q <- p.adjust(dfp$p, method = "BH")
+
+
+identical(dfr$selfeat, dfp$selfeat)
+identical(dfr$feature, dfp$feature)
+
+df <- cbind(dfr, dfp[,c("p","q")])
+df$antigen <- as.vector(str_split_fixed(df$feature, "_", 2)[,2])
+
+df.sub <- subset(df, df$q < 0.005 & abs(df$rho) > 0.99)
+#df.sub <- subset(df, df$q < 0.01 & abs(df$rho) > 0.7)
+#write.csv(df.sub, file = "df.sub.csv", row.names = FALSE)
+
+link.widths <- abs(df.sub$rho)
+#link.widths <- ifelse(abs(df.sub$rho) > 0.5, 5, 1)
+
+link.clr <- ifelse(df.sub$rho > 0, "#DEB18B", "#228c22")
+
+col_fun = colorRamp2(c(-1, -0.5, 0, 0.5, 1), c("#003c30","#c7eae5", "white", "#e7d4e8", "#40004b"))
+
+#wes_palette("Rushmore1")
+
+
+net <- network(df.sub, matrix.type = "edgelist",multiple = TRUE, ignore.eval = FALSE, directed = FALSE)
+
+node.cols <- network.vertex.names(net)
+fc.ind <- which(grepl("FcR", node.cols))
+node.cols[fc.ind] <- "#27223C"
+titer.ind <- which(grepl("Ig", node.cols))
+node.cols[titer.ind] <- "#D10000"
+func.ind <- which(grepl("ADCD|ADCP|ADNP|NK|MIP|IFN|CD107", node.cols))
+node.cols[func.ind] <- "#D1362F"
+CD4.ind <- which(grepl("CD4", node.cols))
+node.cols[CD4.ind] <- "#27223C"
+Lectins.ind <- which(grepl("log.viral", node.cols))
+node.cols[Lectins.ind] <- "#D1362F"
+
+
+#pdf(paste0("correlation_net_vac.pdf"), width = 10, height = 10)
+print(plot.network(net, label = network.vertex.names(net),
+                  #vertex.col = "slategray",
+                  vertex.col = as.color(node.cols),
+                  #mode = "circle",
+                  edge.col = link.clr,
+                  edge.lwd = link.widths,
+                  pad = 1,
+                  vertex.cex = 1.2,
+                  label.cex = 0.85))
+#dev.off()
+```
+

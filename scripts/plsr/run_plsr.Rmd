@@ -1,0 +1,69 @@
+---
+title: "Run PLSR script"
+output: html_document
+date: "2023"
+---
+
+# Load libraries and plsr script
+```{r}
+library(tidyverse)
+library(ropls)
+library(systemsseRology)
+library(purrr)
+source("plsr_novalidation.R") # plsr script
+```
+
+# Load data
+```{r}
+#data.naive <- read.csv("../../data/mfi_roc_4labels.csv")
+data.gy.after <- read.csv("../../data/measurements_and_roc_20weeks.csv")
+data.gy.before <- read.csv("../../data/gy_before_measurement_roc_20weeks.csv")
+#data$new.label <- factor(data$new.label)
+data.gy.after$arm <- factor(data.gy.after$arm)
+```
+
+# Data preprocessing
+```{r}
+# subset naive cases
+#data.naive <- data.naive[which(data.naive$arm == "naive"),c(1,3,4,6:393)]
+data.naive <- data.gy.after[which(data.gy.after$arm == "naive"),]
+
+# create a arm (group information) column in gy.before (this is present in gy after)
+data.gy.before$arm <- "SIVmac239_∆GY"
+data.gy.before <- data.gy.before[,colnames(data.gy.after)]
+
+# merge naive and gy before samples
+data <- rbind(data.gy.before, data.naive)
+
+data <- data.gy.after
+data$arm <- factor(data$arm) 
+data <- data[which(data$week.timepoint >= 1),]
+
+# remove EBOLA features (controls)
+data <- subset(data, select = -c(seq(1,length(colnames(data)))[grepl("EBOV", colnames(data))]))
+```
+
+# Subsetting
+```{r}
+# acute phase (first 4 weeks)
+data.4week <- data[which(data$week.timepoint <= 4),]
+```
+
+```{r}
+data.4week <- data.4week[,c("Animal.No.","arm","week.timepoint",colnames(data.4week)[grepl("239|660", colnames(data.4week))])]
+#data.4week <- data.4week[,colnames(data.4week)[!grepl("EBOV|SHIV", colnames(data.4week))]]
+```
+
+# Run PLSR
+```{r}
+plsr_novalidation(data = data.4week,
+                  colresponse = 2,
+                  colstart = 5,
+                  thresh = 0.7,
+                  alphal = 1, 
+                  nfold = 5,
+                  cvtry = 100,
+                  foldername = "acute_phase",
+                  title = "acute_phase")
+```
+

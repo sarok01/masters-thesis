@@ -1,0 +1,118 @@
+---
+title: "Visualize Viral load"
+output: html_document
+---
+
+
+# Load libraries
+```{r}
+library(tidyverse)
+library(ggplot2)
+```
+
+# Load raw data (in long format)
+```{r}
+data <- read.csv("~/Desktop/thesis (final)/data/data_week_noduplicate.csv")
+```
+
+# Load data
+```{r}
+data.naive <- read.csv("../data/mfi_roc_4labels.csv")
+data.gy.before <- read.csv("../data/gy_before_measurement_roc_20weeks.csv")
+#data$new.label <- factor(data$new.label)
+data.naive$arm <- factor(data.naive$arm)
+```
+
+```{r}
+# subset naive cases
+data.naive <- data.naive[which(data.naive$arm == "naive"),c(1,3,4,6:393)]
+
+# reorder gy before df based on naive df
+data.gy.before$arm <- "SIVmac239_∆GY"
+data.gy.before <- data.gy.before[,colnames(data.naive)]
+
+# merge two df
+data <- rbind(data.gy.before, data.naive)
+data$arm <- factor(data$arm) 
+```
+
+
+# Specify the order of timepoint labels
+```{r}
+data$tp <- factor(data$tp, levels = c("Pre","wk 2","wk 4","wk 6","wk 8","wk 12","wk 14","wk 20","wk 22","wk 23","wk 35"  ,"wk 39" , "wk 40" , "wk 57" , "wk 63" , "wk 71" , "wk 75"  ,"wk 79"  ,"wk 88",  "wk 94",  "wk 102", "wk 104", "wk 111", "wk 139", "wk 151", "wk 162", "wk 165" ,"wk 167" ,"wk 185", "wk 191" ,"wk 193","wk 211" ,"wk 240", "E660 Challenge 0 Day", "E660 Challenge 10 day", "E660 Challenge 2 wk", "E660 Challenge 3 wk", "E660 Challenge 4 wk", "E660 Challenge 6 wk", "E660 Challenge 8 wk", "E660 Challenge 10 wk","E660 Challenge 12 wk","E660 Challenge 16 wk","E660 Challenge 18 wk","E660 Challenge 20 wk","E660 Challenge 24 wk","E660 Challenge 26 wk","E660 Challenge 28 wk","E660 Challenge 39 wk", "E660 Challenge 43 wk", "E660 Challenge 45 wk", "E660 Challenge 48 wk", "E660 Challenge 51 wk", "E660 Challenge 59 wk"))
+```
+
+
+# Plot viral load trends
+```{r}
+#pdf("viral_loads.pdf", width = 8, height = 4)
+ggplot(data=data, aes(x=week.timepoint, y=log10(roc_IgA_SIV.1.mac251))) +
+  geom_line(aes(group = Animal.No.))+
+  geom_point(aes(fill = arm), shape = 21, size = 3)+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+                   legend.position = "top")+
+  geom_vline(xintercept = "E660 Challenge 0 Day", linetype = "dashed", color = "#FFC20A")+
+  scale_fill_manual(values = c("red2", "royalblue2"), labels = c("naive", "SIVmac239∆GY"))+
+  labs(x= "", y=paste0("Viral Load\n", "log10(RNA Copies/mL)"), fill = "Group")
+#dev.off()
+```
+
+# Plot assays
+```{r}
+# Convert to long format for ggplot
+data.long <- pivot_longer(data, cols = c(11:203), names_to = "MFI")
+
+data.long$assay <- str_split_fixed(data.long$MFI, "_",2)[,1]
+data.long$assay[which(data.long$assay == "IgG13")] <- "IgG3"
+#$assay <- factor(data.long$assay, levels = c("TIgG", "IgG1","IgG2","IgG3","IgM", "IgA",
+#                                                "FcRIIA1",  "FcRIIA2",  "FcRIIA3",  "FcRIIA4", "FcRIIIA1"))
+data.long$assay <- factor(data.long$assay, levels = c("TIgG", "IgG1","IgG2","IgG3","IgM", "IgA","FcRIIA1",  "FcRIIA2",  "FcRIIA3",  "FcRIIA4", "FcRIIIA1", "ADCD", "ADNP", "ADCP"))
+data.long$antigen <- str_split_fixed(data.long$MFI, "_",2)[,2]
+```
+
+Biophysical assays
+```{r}
+biophysical.assays <- c("FcRIIA1","FcRIIIA1","IgA","IgG1","IgG3","IgG2","IgM","TIgG")
+temp.all <- data.long[which(data.long$antigen == "gp140_SIVsmE660" & data.long$assay %in% biophysical.assays),] # 
+temp.all$value <- round(as.numeric(temp.all$value),0)
+
+#pdf("Titers_FcRs_gp140_SIVsmE660_v2.pdf", width = 10, height = 6)
+ggplot(data=temp.all, aes(x=tp, y=log10(value))) +
+  geom_line(aes(group = Animal.No.))+
+  #geom_line(data = med, aes(x=Weeks.after, y=median, color = group), size = 1.5)+
+  geom_point(aes(fill = arm), shape = 21, size = 3)+
+  theme_minimal()+theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+                   legend.position = "top")+
+  scale_fill_manual(values = c("red2", "royalblue2"), labels = c("naive", "SIVmac239∆GY"))+
+  geom_vline(xintercept = "E660 Challenge 0 Day", linetype = "dashed", color = "#FFC20A")+
+  ylim(3,7)+
+  #ylab(paste0("gp140_SIVsmE660\n", "log10 (MFI)")) +xlab("") +
+  labs(fill = 'Group', y = paste0("gp140_SIVsmE660\n", "log10 (MFI)"), x = "")+
+  facet_wrap(. ~ assay, ncol = 2, scales = "free_y")
+#dev.off()
+```
+
+Functional assays
+```{r}
+temp.all <- data.long[which(data.long$antigen == "Mac_239" | data.long$antigen == "E660" ),]  
+temp.all <- data.long[which(data.long$assay == "ADNP"),]  
+temp.all$value <- round(as.numeric(temp.all$value),0)
+
+#pdf("functional_all_3.pdf", width = 10, height = 2)
+ggplot(data=temp.all, aes(x=tp, y=value)) +
+  geom_line(aes(group = Animal.No.))+
+  #geom_line(data = med, aes(x=Weeks.after, y=median, color = group), size = 1.5)+
+  geom_point(aes(fill = arm), shape = 21, size = 3)+
+  theme_minimal()+
+  theme(axis.text.x = element_blank(),
+                   legend.position = "top")+
+  scale_fill_manual(values = c("red2", "royalblue2"), labels = c("naive", "SIVmac239∆GY"))+
+  geom_vline(xintercept = "E660 Challenge 0 Day", linetype = "dashed", color = "#FFC20A")+
+  #ylab(paste0("gp140_SIVsmE660\n", "log10 (MFI)")) +xlab("") +
+  labs(fill = 'Group', y = paste0("Phagoscore"), x = "")+
+  facet_wrap(. ~ antigen + assay, ncol = 2, scales = "fixed")
+#dev.off()
+```
+
+

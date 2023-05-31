@@ -1,0 +1,104 @@
+---
+title: "Untitled"
+output: html_document
+date: "2023"
+---
+
+# Load libraries
+```{r}
+library(dplyr)
+library(corrplot)
+library(glmnet) #lasso
+library(ggplot2)
+library(tibble)
+library(pROC) #auc
+library(corrr)
+library(tidyverse)
+library(forecast) #arima forecast
+library(stats)
+library(zoo) #rollmean
+library(caret)
+library(systemsseRology)
+library(reshape2)
+```
+
+# Load data
+```{r}
+data <- read.csv("../data/measurements_20weeks.csv")
+```
+
+# Peak viral load timepoint
+```{r}
+# Filtering peak viral load timepoints
+peak.tp <- data[which(data$week.timepoint < 6),]
+peak.tp <- peak.tp %>% group_by(Animal.No.) %>% filter(RNACopies.ml == max(RNACopies.ml))
+
+peak.tp <- data[which(data$week.timepoint == 3),]
+```
+
+```{r}
+# check features 
+colnames(data)[(grepl("660|239",colnames(data)))]
+```
+
+## Run PCA model
+```{r}
+# PCA using "prcomp" functions
+pca.temp <- prcomp(peak.tp[,colnames(data)[(grepl("660|239",colnames(data)))]] , scale = TRUE, center = TRUE)
+pcs <- as.data.frame(pca.temp$x)
+
+# labels to use to colour and shape samples 
+pcs$VL <- log10(as.numeric(peak.tp$RNACopies.ml))
+pcs$arm <- peak.tp$arm
+
+# Calculate percentage of variance
+PoV <- pca.temp$sdev^2/sum(pca.temp$sdev^2)
+
+scores <- ggplot(pcs, aes(x=PC1, y=PC2)) +
+  geom_point(aes(fill = VL, shape = arm), size = 3)+
+  scale_shape_manual(values = c(21, 24))+
+  geom_hline(yintercept = 0, linetype = 2, colour = "slategray")+
+  geom_vline(xintercept = 0, linetype = 2, colour = "slategray")+
+  theme_classic()+
+  xlab(paste0("PC1 (",as.character(signif(PoV[1]*100,3)),"%)")) +
+  ylab(paste0("PC2 (",as.character(signif(PoV[2]*100,3)),"%)")) + ggtitle(" ")+
+  theme(aspect.ratio=1)
+```
+
+## Loadings
+```{r}
+## Get the loading scores
+loads <- as.data.frame(pca.temp$rotation)
+loads$feature <- row.names(loads)
+loads$absPC1 <- abs(loads$PC1)
+
+loads <- loads[order(-loads$absPC1),]
+lo <- loads[1:10,]
+lo$feature <- factor(lo$feature , levels = lo$feature)
+
+p.loads <- ggplot(data=lo, aes(x=feature, y=PC1))+
+  geom_bar(stat="identity", colour = "black") +coord_flip()+
+  #geom_bar(stat="identity", aes(fill = group), colour = "black") +coord_flip()+
+  #scale_fill_manual(breaks = g.arms , values = col.arms)+
+  theme_classic() + ylab("PC1 loadings") + xlab("") +theme(legend.position = "none")
+```
+
+## Plot
+```{r}
+## Look at the features that align with your cluster of samples to see that these drive the separation
+loadings <- ggplot(lo, aes(x=PC1, y=PC2)) + 
+  #geom_text_repel(aes(label = feature), size = 1, segment.size  = 0.2, max.overlaps = Inf) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "slategray")+
+  geom_vline(xintercept = 0, linetype = 2, colour = "slategray")+
+  theme_classic()+
+  xlab(paste0("PC1 (",as.character(signif(PoV[1]*100,3)),"%)")) +
+  ylab(paste0("PC2 (",as.character(signif(PoV[2]*100,3)),"%)")) + ggtitle(" ")+
+  theme(aspect.ratio=1,text = element_text(size=10),
+        axis.text.x = element_text(size = 8))
+
+
+#pdf(paste0("pca_peakviral.pdf"), width = 10, height = 5)
+print(scores + p.loads)
+#dev.off()
+```
+

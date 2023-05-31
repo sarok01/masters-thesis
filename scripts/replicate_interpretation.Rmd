@@ -1,0 +1,127 @@
+---
+title: "Replicate Comparison"
+output: html_document
+date: "2023"
+---
+
+```{r}
+library(dplyr)
+library(corrplot)
+library(glmnet) #lasso
+library(ggplot2)
+library(tibble)
+library(pROC) #auc
+library(corrr)
+library(tidyverse)
+library(forecast) #arima forecast
+library(stats)
+library(zoo) #rollmean
+library(caret)
+library(systemsseRology)
+library(reshape2)
+```
+
+# Load the data
+```{r}
+data <- read.csv("../data/nv.csv")
+```
+
+# Subset duplicated samples based on Animal.No, timepoint and arm(group)
+```{r}
+View(data[duplicated(data[,c(1,6,7)]),])
+```
+
+# Make unique labels for animal-timepoint-group combinations
+```{r}
+labeling <- paste(data$Animal.No., gsub(" ", ".",data$tp), gsub("SIVmac239_ΔGY", "vaccinated",data$arm), sep  = "_")
+#data.transformed <- data.frame(t(data))
+#data.transformed["labeling",] <- labeling
+#View(data.transformed)
+```
+
+# Print labels and index positions for dataframe operations
+```{r}
+labeling[duplicated(labeling)]
+seq_along(labeling)[duplicated(labeling)]
+```
+
+# Create a df for ggplot 
+```{r}
+df.holder <- data.frame(LI98_E660.Challenge.10.day_naive.rep1 = as.numeric(data[c(2), c(8:200)]), LI98_E660.Challenge.10.day_naive.rep2 = as.numeric(data[c(3), c(8:200)]))
+df.holder$LI98_E660.Challenge.6.wk_naive.rep1 <- as.numeric(data[c(4), c(8:200)])
+df.holder$LI98_E660.Challenge.6.wk_naive.rep2 <- as.numeric(data[c(5), c(8:200)])
+df.holder$LI98_E660.Challenge.10.wk_naive.rep1 <- as.numeric(data[c(6), c(8:200)])
+df.holder$LI98_E660.Challenge.10.wk_naive.rep2 <- as.numeric(data[c(7), c(8:200)])
+df.holder$MA19_E660.Challenge.10.wk_naive.rep1 <- as.numeric(data[c(11), c(8:200)])
+df.holder$MA19_E660.Challenge.10.wk_naive.rep2 <- as.numeric(data[c(12), c(8:200)])
+df.holder$MA25_E660.Challenge.6.wk_naive.rep1 <- as.numeric(data[c(21), c(8:200)])
+df.holder$MA25_E660.Challenge.6.wk_naive.rep2 <- as.numeric(data[c(22), c(8:200)])
+df.holder$MA25_E660.Challenge.10.wk_naive.rep1 <- as.numeric(data[c(23), c(8:200)])
+df.holder$MA25_E660.Challenge.10.wk_naive.rep2 <- as.numeric(data[c(24), c(8:200)])
+df.holder$MA39_E660.Challenge.3.wk_naive.rep1 <- as.numeric(data[c(27), c(8:200)])
+df.holder$MA39_E660.Challenge.3.wk_naive.rep2 <- as.numeric(data[c(28), c(8:200)])
+df.holder$LJ04_E660.Challenge.2.wk_vaccinated.rep1 <- as.numeric(data[c(54), c(8:200)])
+df.holder$LJ04_E660.Challenge.2.wk_vaccinated.rep2 <- as.numeric(data[c(55), c(8:200)])
+df.holder$MA18_wk.2_vaccinated.rep1 <- as.numeric(data[c(90), c(8:200)])
+df.holder$MA18_wk.2_vaccinated.rep2 <- as.numeric(data[c(91), c(8:200)])
+df.holder$MA18_wk.8_vaccinated.rep1 <- as.numeric(data[c(94), c(8:200)])
+df.holder$MA18_wk.8_vaccinated.rep2 <- as.numeric(data[c(95), c(8:200)])
+df.holder$MA18_E660.Challenge.2.wk_vaccinated.rep1 <- as.numeric(data[c(101), c(8:200)])
+df.holder$MA18_E660.Challenge.2.wk_vaccinated.rep2 <- as.numeric(data[c(102), c(8:200)])
+df.holder$MA23_Pre_vaccinated.rep1 <- as.numeric(data[c(111), c(8:200)])
+df.holder$MA23_Pre_vaccinated.rep2 <- as.numeric(data[c(112), c(8:200)])
+df.holder$MA23_wk.2_vaccinated.rep1 <- as.numeric(data[c(113), c(8:200)])
+df.holder$MA23_wk.2_vaccinated.rep2 <- as.numeric(data[c(114), c(8:200)])
+
+# group information for coloring
+df.holder$group <- ifelse(grepl("FcR",colnames(data)[8:200]), "FcR", 
+                                ifelse(grepl("AD", colnames(data)[8:200]), "Functional", 
+                                             ifelse(grepl("Ig", colnames(data)[8:200]), "Antibody",
+                                                          "Viral load")))
+```
+
+# Convert to long format for ggplot
+```{r}
+# group of columns names for replicate1 and replicate2
+rep1.names <- colnames(df.holder)[grepl("rep1",colnames(df.holder))]
+rep2.names <- colnames(df.holder)[grepl("rep2",colnames(df.holder))]
+
+# long format
+df.holder.melted <- melt(df.holder[,c(rep1.names, "group")], id = "group")
+df.holder.melted <- bind_cols(df.holder.melted, melt(df.holder[,rep2.names]))
+colnames(df.holder.melted) <- c("id","rep1.label", "rep1.value", "rep2.label", "rep2.value")
+df.holder.melted$plot.label <- gsub("E660.Challenge.", "", df.holder.melted$rep1.label)
+df.holder.melted$plot.label <- gsub("naive.rep1", "", df.holder.melted$plot.label)
+df.holder.melted$plot.label <- gsub("vaccinated.rep1", "", df.holder.melted$plot.label)
+df.holder.melted$plot.label <- gsub("_", " ", df.holder.melted$plot.label)
+df.holder.melted <- df.holder.melted[which(df.holder.melted$rep1.label != "MA18_E660.Challenge.2.wk_vaccinated.rep1"),]
+#View(df.holder.melted)
+```
+
+# Plot
+```{r}
+#pdf("replicate_comparison_siv.pdf", width = 10, height = 8.5)
+ggplot(df.holder.melted, aes(x=rep1.value, y=rep2.value, color = id)) + 
+  geom_point() + 
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", alpha = 0.3)+
+  scale_y_log10() +
+  scale_x_log10() + 
+  theme_bw()+theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6), axis.text.y = element_text(angle = 45, hjust = 1, size = 6), legend.position = "top") + 
+  labs(color = "Measurement Type", y = paste0("Replicate 2\n", "log10 (MFI)"),  x = paste0("Replicate 1\n", "log10 (MFI)")) + 
+  facet_wrap(~rep1.label, ncol = 3, labeller = labeller(rep1.label = c(LI98_E660.Challenge.10.day_naive.rep1 = "LI98 Day 10",
+                                                             LI98_E660.Challenge.6.wk_naive.rep1 = "LI98 Week 6",
+                                                             LI98_E660.Challenge.10.wk_naive.rep1 = "LI98 Week 10",
+                                                             MA19_E660.Challenge.10.wk_naive.rep1 = "MA19 Week 10",
+                                                             MA25_E660.Challenge.6.wk_naive.rep1 = "MA25 Week 6",
+                                                             MA25_E660.Challenge.10.wk_naive.rep1 = "MA25 Week 10",
+                                                             MA39_E660.Challenge.3.wk_naive.rep1 = "MA39 Week 3",
+                                                             LJ04_E660.Challenge.2.wk_vaccinated.rep1 = "LJ04 Week 2",
+                                                             MA18_wk.2_vaccinated.rep1 = "MA18 Week 2",
+                                                             MA18_wk.8_vaccinated.rep1 = "MA18 Week 8",
+                                                             MA18_wk.2_vaccinated.rep1 = "MA18 Week 2",
+                                                             #MA18_E660.Challenge.2.wk_vaccinated.rep1 = "MA18 Week 2",
+                                                             MA23_Pre_vaccinated.rep1 = "MA23 Week 0",
+                                                             MA23_wk.2_vaccinated.rep1 = "MA23 Week 2"
+                                                             )))
+#dev.off()
+```
